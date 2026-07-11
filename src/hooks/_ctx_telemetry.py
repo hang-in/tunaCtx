@@ -37,6 +37,24 @@ _NOTICE_STATE = _HOME / ".claude" / ".ctx-telemetry.notified"
 # Schema version — bump on payload shape change
 _SCHEMA = 1
 
+# Bound ctx-telemetry.jsonl growth: cap the file at ~2MB and keep only the tail
+# on overflow so it cannot grow without limit over long-term use.
+_MAX_LOG_BYTES = 2_000_000
+_KEEP_LINES = 5000
+
+
+def _append_capped_jsonl(path: "Path", line: str) -> None:
+    """Append a JSONL line, rotating to keep only the tail when over the cap."""
+    try:
+        if path.exists() and path.stat().st_size > _MAX_LOG_BYTES:
+            lines = path.read_text(encoding="utf-8").splitlines()
+            keep = lines[-_KEEP_LINES:] if lines else []
+            path.write_text("\n".join(keep) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+    with path.open("a", encoding="utf-8") as f:
+        f.write(line)
+
 # Coarse project id: last segment of CWD (no full path — avoids user/dir leaks)
 def _project_id() -> str:
     try:
@@ -202,8 +220,7 @@ def log_event(event_type: str, payload: dict = None) -> None:
             **_sanitize(event_type, payload or {}),
         }
         _LOG.parent.mkdir(parents=True, exist_ok=True)
-        with _LOG.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        _append_capped_jsonl(_LOG, json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:
         # Silent — never break the hook
         pass

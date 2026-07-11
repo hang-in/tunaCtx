@@ -26,8 +26,9 @@ Env vars:
   CTX_BGE_DEVICE       — "cuda" / "cpu" (default: auto-detect)
   CTX_BGE_FP16         — "1" to load fp16 on GPU (halves VRAM; default "1")
 """
-import sys, os, json, socket, threading, time
+import sys, os, json, socket, time
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 SOCKET_PATH = Path.home() / ".local/share/claude-vault/bge-daemon.sock"
 PID_FILE    = Path.home() / ".local/share/claude-vault/bge-daemon.pid"
@@ -201,6 +202,11 @@ def main():
     srv.settimeout(1.0)
     log(f"listening on {listen_target}")
 
+    # Bounded worker pool: replaces unbounded threading.Thread-per-connection
+    # so a burst of clients can't spawn unlimited concurrent rerank calls.
+    MAX_WORKERS = 16
+    executor = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="bge")
+
     while True:
         if STOP_FILE.exists():
             log("stop file detected — shutting down")
@@ -208,13 +214,13 @@ def main():
             break
         try:
             conn, _ = srv.accept()
-            t = threading.Thread(target=handle_client, args=(conn, model), daemon=True)
-            t.start()
+            executor.submit(handle_client, conn, model)
         except socket.timeout:
             continue
         except Exception as e:
             log(f"accept error: {e}")
 
+    executor.shutdown(wait=False)
     srv.close()
     if not USE_TCP:
         SOCKET_PATH.unlink(missing_ok=True)

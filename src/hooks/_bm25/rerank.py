@@ -109,6 +109,46 @@ def vec_embed(text: str):
     return None
 
 
+def vec_embed_batch(texts: list, max_batch: int = 64):
+    """Embed a batch of texts in ONE vec-daemon round-trip.
+
+    Returns list[list[float]] in input order, or None on failure (e.g. daemon
+    down). Mirrors vec_embed()'s "query: " prefix + 1000-char truncation, so
+    callers can swap per-item vec_embed() loops for a single batch call with
+    identical embeddings. Callers fall back to no-op when this returns None.
+    """
+    if VEC_DISABLED:
+        return None
+    if not texts:
+        return []
+    if not USE_TCP and not VEC_SOCK.exists():
+        return None
+    try:
+        if USE_TCP:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(VEC_TIMEOUT)
+            s.connect(("127.0.0.1", VEC_PORT))
+        else:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(VEC_TIMEOUT)
+            s.connect(str(VEC_SOCK))
+        payload = (json.dumps({"batch": [str(t)[:1000] for t in texts]}) + "\n").encode("utf-8")
+        s.sendall(payload)
+        buf = b""
+        while b"\n" not in buf:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        s.close()
+        resp = json.loads(buf.split(b"\n")[0].decode("utf-8"))
+        if resp.get("ok"):
+            return resp.get("embs")
+    except Exception:
+        return None
+    return None
+
+
 def cosine(a, b):
     if not a or not b or len(a) != len(b):
         return 0.0
@@ -166,16 +206,21 @@ def semantic_rerank_filter(candidates, query, top_k, alpha_bm25=0.6,
             # CE filtered everything → fall back to bi-encoder
 
     # ── Bi-encoder fallback (original path) ───
-    q_emb = vec_embed(query)
-    if not q_emb:
+    # Batch query + all candidate embeddings into ONE vec-daemon round-trip
+    # (was N+1 per-item vec_embed() calls → N+1 socket round-trips before).
+    cand_texts = [c.get("subject") or c.get("text") or "" for c in candidates]
+    batch = vec_embed_batch([query] + [t[:400] for t in cand_texts])
+    if not batch or len(batch) != len(cand_texts) + 1:
         return candidates[:top_k]   # daemon down → no-op
+
+    q_emb = batch[0]
+    cand_embs = batch[1:]
 
     rescored = []
     for i, c in enumerate(candidates):
-        text = c.get("subject") or c.get("text") or ""
-        if not text:
+        if not cand_texts[i]:
             continue
-        c_emb = vec_embed(text[:400])   # short for speed
+        c_emb = cand_embs[i]
         if not c_emb:
             continue
         cos = cosine(q_emb, c_emb)

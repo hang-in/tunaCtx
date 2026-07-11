@@ -13,7 +13,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from .rerank import vec_embed as _vec_embed
+from .rerank import vec_embed as _vec_embed, vec_embed_batch as _vec_embed_batch
 
 # ── Decision commit detection ────────────────────────────────────────────────
 
@@ -156,21 +156,36 @@ def build_decision_corpus(project_dir, n=500):
 def embed_corpus_items(corpus):
     """Add 'emb' field to corpus items using vec-daemon. Modifies in-place.
 
-    Only embeds items missing 'emb'. Returns count of newly embedded items.
-    Fail-safe: if vec-daemon is down, items are left without 'emb' and
-    dense_rank_decisions will return [] (BM25-only fallback).
+    Only embeds items missing 'emb'. Batches all missing items into a single
+    vec-daemon round-trip (falls back to per-item if the batch call is
+    unavailable, e.g. daemon down). Fail-safe: if vec-daemon is down, items
+    are left without 'emb' and dense_rank_decisions will return [] (BM25-only
+    fallback).
     """
-    embedded = 0
+    to_embed = []
     for item in corpus:
         if item.get("emb"):
             continue
         text = (item.get("subject") or item.get("text") or "")[:400]
         if not text:
             continue
-        emb = _vec_embed(text)
-        if emb:
+        to_embed.append((item, text))
+    if not to_embed:
+        return 0
+
+    embs = _vec_embed_batch([t for _, t in to_embed])
+    embedded = 0
+    if embs and len(embs) == len(to_embed):
+        for (item, _), emb in zip(to_embed, embs):
             item["emb"] = emb
             embedded += 1
+    else:
+        # Fallback: per-item (e.g. daemon down) — preserves original behavior.
+        for item, text in to_embed:
+            emb = _vec_embed(text)
+            if emb:
+                item["emb"] = emb
+                embedded += 1
     return embedded
 
 
