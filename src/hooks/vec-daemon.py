@@ -13,8 +13,9 @@ Usage:
   python3 vec-daemon.py &          # start in background
   python3 vec-daemon.py --stop     # create stop file
 """
-import sys, os, json, socket, threading, time, struct
+import sys, os, json, socket, time, struct
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 SOCKET_PATH = Path.home() / ".local/share/claude-vault/vec-daemon.sock"
 PID_FILE    = Path.home() / ".local/share/claude-vault/vec-daemon.pid"
@@ -55,8 +56,25 @@ def handle_client(conn: socket.socket, model):
             if not chunk:
                 return
             buf += chunk
+            if len(buf) > 10_000_000:   # 10MB request cap (matches bge-daemon)
+                raise ValueError("request too large")
         line = buf.split(b"\n")[0]
         req = json.loads(line.decode("utf-8"))
+
+        # Batch embedding: one request → many embeddings in a single encode call.
+        # Keeps the line protocol backward-compatible with single {"q": ...}.
+        batch = req.get("batch")
+        if batch:
+            if not isinstance(batch, list) or not batch:
+                raise ValueError("empty batch")
+            if len(batch) > 64:
+                raise ValueError("batch too large (max 64)")
+            texts = ["query: " + str(t)[:1000] for t in batch]
+            embs = model.encode(texts, normalize_embeddings=True)
+            resp = json.dumps({"ok": True, "embs": embs.tolist()}) + "\n"
+            conn.sendall(resp.encode("utf-8"))
+            return
+
         q = req.get("q", "")
         if not q:
             raise ValueError("empty query")
@@ -104,6 +122,11 @@ def main():
     srv.settimeout(1.0)  # 1s accept timeout for stop-check loop
     print(f"[vec-daemon] Listening on {listen_target}", flush=True)
 
+    # Bounded worker pool: replaces unbounded threading.Thread-per-connection
+    # so a burst of clients can't spawn unlimited concurrent model.encode() calls.
+    MAX_WORKERS = 16
+    executor = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="vec")
+
     while True:
         if STOP_FILE.exists():
             print("[vec-daemon] Stop file detected. Shutting down.")
@@ -111,13 +134,13 @@ def main():
             break
         try:
             conn, _ = srv.accept()
-            t = threading.Thread(target=handle_client, args=(conn, model), daemon=True)
-            t.start()
+            executor.submit(handle_client, conn, model)
         except socket.timeout:
             continue
         except Exception as e:
             print(f"[vec-daemon] Accept error: {e}", flush=True)
 
+    executor.shutdown(wait=False)
     srv.close()
     if not USE_TCP:
         SOCKET_PATH.unlink(missing_ok=True)

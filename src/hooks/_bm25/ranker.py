@@ -26,6 +26,55 @@ from .rerank import vec_embed as _vec_embed, cosine as _cosine, semantic_rerank_
 last_retrieval_scores: dict = {}
 
 
+# ── BM25 index cache ─────────────────────────────────────────────────────────
+# The decision corpus only changes on git HEAD change (guarded by the .omc
+# cache in corpus.py). Rebuilding BM25Okapi on every UserPromptSubmit hook call
+# was pure allocation churn. Cache the tokenized corpus + BM25 index keyed by a
+# cheap content fingerprint so the index is rebuilt only when HEAD actually
+# changes. Bounded FIFO eviction prevents unbounded memory growth.
+_BM25_INDEX_CACHE: "dict[int, tuple]" = {}
+_BM25_INDEX_CACHE_MAX = 4
+
+
+def _corpus_fingerprint(corpus: list) -> "int | None":
+    if not corpus:
+        return None
+    try:
+        return hash((
+            len(corpus),
+            corpus[0].get("subject", ""),
+            corpus[-1].get("subject", ""),
+            sum(len(c.get("text", "")) for c in corpus[:64]),
+        ))
+    except Exception:
+        return None
+
+
+def _get_bm25_index(corpus: list):
+    """Return (tokenized_corpus, BM25Okapi) for `corpus`, using a fingerprint cache.
+
+    Keyed by content fingerprint (not id()) because get_decision_corpus()
+    returns a freshly deserialized list each call even when HEAD is unchanged.
+    """
+    fp = _corpus_fingerprint(corpus)
+    if fp is not None:
+        cached = _BM25_INDEX_CACHE.get(fp)
+        if cached is not None:
+            return cached
+    tokenized = [tokenize(c["text"]) for c in corpus]
+    bm25 = BM25Okapi(tokenized)
+    if fp is not None:
+        if len(_BM25_INDEX_CACHE) >= _BM25_INDEX_CACHE_MAX:
+            _BM25_INDEX_CACHE.pop(next(iter(_BM25_INDEX_CACHE)))  # FIFO evict
+        _BM25_INDEX_CACHE[fp] = (tokenized, bm25)
+    return tokenized, bm25
+
+
+# Single-entry cache for score_corpus_bm25: the eval retriever holds one stable
+# tokenized corpus across all its queries, so id() is a safe, stable key here.
+_SCORE_BM25_CACHE: "dict[str, object]" = {"key": None, "bm25": None}
+
+
 def dense_rank_decisions(corpus, query, top_k=20):
     """Dense first-stage retrieval: cosine similarity between query embedding
     and pre-computed corpus embeddings (from embed_corpus_items).
@@ -104,7 +153,12 @@ def score_corpus_bm25(tokenized_corpus, query_tokens):
         return None
     try:
         import numpy as np
-        bm25 = BM25Okapi(tokenized_corpus)
+        k = id(tokenized_corpus)
+        bm25 = _SCORE_BM25_CACHE["bm25"] if _SCORE_BM25_CACHE["key"] == k else None
+        if bm25 is None:
+            bm25 = BM25Okapi(tokenized_corpus)
+            _SCORE_BM25_CACHE["key"] = k
+            _SCORE_BM25_CACHE["bm25"] = bm25
         return np.array(bm25.get_scores(query_tokens))
     except Exception:
         return None
@@ -145,8 +199,8 @@ def bm25_rank_decisions(corpus, query, top_k=7, min_score=0.5,
     # Layer 2 (2026-04-24): synonym expansion to bridge KO↔EN + concept gaps
     query_tokens = expand_query_tokens(query_tokens)
 
-    tokenized = [tokenize(c["text"]) for c in corpus]
-    bm25 = BM25Okapi(tokenized)
+    # Reuse cached tokenized corpus + BM25 index (rebuilt only on HEAD change).
+    tokenized, bm25 = _get_bm25_index(corpus)
     scores = bm25.get_scores(query_tokens)
     if len(scores) == 0 or float(max(scores)) < min_score:
         return []

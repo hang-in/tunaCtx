@@ -57,6 +57,26 @@ _SKIP_PREFIXES = (".omc/", "docs/", "benchmarks/results/", "tests/fixtures/")
 _REINDEX_LOCK = os.path.expanduser("~/.cache/codebase-memory-mcp/.reindex_in_progress")
 _STALE_THRESHOLD_HOURS = 24
 
+# Bound retrieval_log.jsonl growth: cap the file at ~2MB and keep only the tail
+# on overflow so it can't grow without limit across long-running sessions.
+_RETRIEVAL_LOG_MAX_BYTES = 2_000_000
+_RETRIEVAL_LOG_KEEP_LINES = 5000
+
+
+def _append_capped_jsonl(path: str, line: str) -> None:
+    """Append a JSONL line, rotating to keep only the tail when over the cap."""
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > _RETRIEVAL_LOG_MAX_BYTES:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.read().splitlines()
+            keep = lines[-_RETRIEVAL_LOG_KEEP_LINES:] if lines else []
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(keep) + "\n")
+    except Exception:
+        pass
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(line)
+
 
 # ── Keyword extraction ────────────────────────────────────────────────────────
 
@@ -119,8 +139,7 @@ def log_retrieved_nodes(project_dir, session_id, prompt, block, items):
             "block": block,
             "items": items[:10],
         }
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        _append_capped_jsonl(log_path, json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception:
         pass
 
